@@ -88,6 +88,30 @@ enum Sys {
         return v ?? false
     }
 
+    /// Seconds since the last keyboard/mouse/trackpad input.
+    static var userIdleSeconds: TimeInterval {
+        CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
+    }
+
+    private static let probeSession: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        c.timeoutIntervalForRequest = 10
+        c.timeoutIntervalForResource = 15
+        c.waitsForConnectivity = false
+        return URLSession(configuration: c)
+    }()
+
+    /// Checks real internet access (not just Wi-Fi) using Apple's connectivity-check page.
+    static func checkInternet(_ done: @escaping (Bool) -> Void) {
+        var req = URLRequest(url: URL(string: "https://www.apple.com/library/test/success.html")!)
+        req.httpMethod = "HEAD"
+        probeSession.dataTask(with: req) { _, response, error in
+            let ok = error == nil && ((response as? HTTPURLResponse).map { (200..<400).contains($0.statusCode) } ?? false)
+            DispatchQueue.main.async { done(ok) }
+        }.resume()
+    }
+
     static func battery() -> (percent: Int, onAC: Bool)? {
         guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
               let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef]
@@ -118,6 +142,7 @@ enum Prefs {
             "sustainSeconds": 60.0, // must stay over the limit this long before acting
             "action": "sleep",      // "sleep" or "notify"
             "lowBattery": 10,       // % on battery; 0 = off
+            "offlineMinutes": 15,   // sleep after this long without internet; 0 = off
         ])
     }
     static var keepAwake: Bool { get { d.bool(forKey: "keepAwake") } set { d.set(newValue, forKey: "keepAwake") } }
@@ -128,6 +153,7 @@ enum Prefs {
     static var sustain: Double { d.double(forKey: "sustainSeconds") }
     static var action: String { get { d.string(forKey: "action") ?? "sleep" } set { d.set(newValue, forKey: "action") } }
     static var lowBattery: Int { get { d.integer(forKey: "lowBattery") } set { d.set(newValue, forKey: "lowBattery") } }
+    static var offlineMinutes: Int { get { d.integer(forKey: "offlineMinutes") } set { d.set(newValue, forKey: "offlineMinutes") } }
 }
 
 // MARK: - Slack notifications (Incoming Webhook)
@@ -201,6 +227,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastHotAlert = Date.distantPast
     private var sleepingForSafety = false
     private var lastTrigger: String?
+    private var offlineSince: Date?
+    private var lastProbe = Date.distantPast
 
     func applicationDidFinishLaunching(_ note: Notification) {
         Prefs.register()
@@ -265,7 +293,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         power = Sys.battery()
         lidClosed = Sys.lidClosed
         updateTitle()
+        if Date().timeIntervalSince(lastProbe) >= 60 {
+            lastProbe = Date()
+            Sys.checkInternet { [weak self] ok in
+                guard let self else { return }
+                if ok { self.offlineSince = nil } else if self.offlineSince == nil { self.offlineSince = Date() }
+            }
+        }
         guard Prefs.keepAwake, !sleepingForSafety else { hotSince = nil; return }
+
+        // Offline: agents can't do anything without internet. Sleep once offline long enough,
+        // if the lid is closed or nobody has touched the Mac for that long either.
+        if Prefs.offlineMinutes > 0, let since = offlineSince {
+            let limit = TimeInterval(Prefs.offlineMinutes * 60)
+            if Date().timeIntervalSince(since) >= limit, lidClosed || Sys.userIdleSeconds >= limit {
+                safetySleep("No internet for \(Int(Date().timeIntervalSince(since) / 60)) min")
+                return
+            }
+        }
 
         // Low battery
         if Prefs.lowBattery > 0, let p = power, !p.onAC, p.percent <= Prefs.lowBattery {
@@ -312,6 +357,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSSound(named: "Sosumi")?.play()
             return
         }
+        safetySleep(reason)
+    }
+
+    /// Notify Slack (best effort, max 6 s), turn keep-awake off and sleep now.
+    private func safetySleep(_ reason: String) {
         sleepingForSafety = true
         lastTrigger = reason
         var finished = false
@@ -330,6 +380,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if sleepingForSafety {
             sleepingForSafety = false
             hotSince = nil
+            offlineSince = nil
             Push.send("Mac woke up", "It was put to sleep earlier (\(lastTrigger ?? "?")). Keep-awake is off.",
                       priority: 3, tags: "sunrise")
         }
@@ -371,6 +422,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let c = cpu.map { "\(Int($0))°C" } ?? "–", b = batteryTemp.map { "\(Int($0))°C" } ?? "–"
         info("CPU \(c)  ·  Battery \(b)  ·  \(name(thermal))")
         if let p = power { info("Battery \(p.percent)% \(p.onAC ? "(plugged in)" : "(on battery)")  ·  Lid \(lidClosed ? "closed" : "open")") }
+        if let since = offlineSince { info("⚠︎ No internet for \(Int(Date().timeIntervalSince(since) / 60)) min") }
         if sleepingForSafety, let t = lastTrigger { info("Last safety sleep: \(t)") }
         menu.addItem(.separator())
 
@@ -387,6 +439,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         sub("Battery temp limit: \(Int(Prefs.batteryLimit))°C") { m in
             for v in [38, 40, 42, 45, 48] { item("\(v)°C", #selector(setBatt), checked: Int(Prefs.batteryLimit) == v, tag: v, in: m) }
+        }
+        sub("Sleep when offline for: \(Prefs.offlineMinutes == 0 ? "off" : "\(Prefs.offlineMinutes) min")") { m in
+            for v in [0, 5, 15, 30, 60] { item(v == 0 ? "Off" : "\(v) min", #selector(setOffline), checked: Prefs.offlineMinutes == v, tag: v, in: m) }
         }
         sub("Sleep on battery below: \(Prefs.lowBattery == 0 ? "off" : "\(Prefs.lowBattery)%")") { m in
             for v in [0, 5, 10, 20, 30] { item(v == 0 ? "Off" : "\(v)%", #selector(setLow), checked: Prefs.lowBattery == v, tag: v, in: m) }
@@ -407,6 +462,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func setCpu(_ s: NSMenuItem) { Prefs.cpuLimit = Double(s.tag); updateTitle() }
     @objc private func setBatt(_ s: NSMenuItem) { Prefs.batteryLimit = Double(s.tag); updateTitle() }
     @objc private func setLow(_ s: NSMenuItem) { Prefs.lowBattery = s.tag }
+    @objc private func setOffline(_ s: NSMenuItem) { Prefs.offlineMinutes = s.tag }
     @objc private func testPush() {
         let c = cpu.map { "\(Int($0))°C" } ?? "?"
         // Priority 4 so the mention (and therefore the phone push) is exercised too.
