@@ -8,7 +8,7 @@ A menu bar app that keeps your Mac awake with the lid closed (so Claude agents k
 - Quitting the app restores normal sleep.
 
 ## Download
-Every push to `main` builds the app in GitHub Actions. Download `LidLLM.dmg` from the run's **Artifacts**. Pushing a `v*` tag, for example `git tag v1.0 && git push --tags`, also publishes it as a GitHub Release.
+Publishing a GitHub Release builds the app in GitHub Actions and attaches `LidLLM.dmg` to that release. On GitHub, go to **Releases → Draft a new release**, create a tag such as `v1.0`, and click **Publish**. Or run `gh release create v1.0 --generate-notes`.
 
 Open the DMG and drag LidLLM to Applications. The app is ad-hoc signed, not notarized, so macOS blocks it on first launch. Run this once to unblock it:
 `xattr -dr com.apple.quarantine /Applications/LidLLM.app`
