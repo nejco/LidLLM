@@ -7,7 +7,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -target arm64-apple-macos14 Sources/main.swift -o "$APP/Contents/MacOS/LidLLM"
 cp Resources/Info.plist "$APP/Contents/"
-cp Resources/setup-sudo.sh "$APP/Contents/Resources/"
+cp Resources/setup-sudo.sh slack-app-manifest.yml "$APP/Contents/Resources/"
 codesign --force --sign - "$APP"
 echo "Built $APP"
 if [ "$1" = "--install" ]; then

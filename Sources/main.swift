@@ -1,5 +1,5 @@
 // LidLLM — keeps the Mac awake with the lid closed, and puts it to sleep
-// (and pings your phone via ntfy) when it gets too hot or the battery runs low.
+// (and pings you on Slack) when it gets too hot or the battery runs low.
 
 import Cocoa
 import IOKit
@@ -111,8 +111,8 @@ enum Prefs {
     static func register() {
         d.register(defaults: [
             "keepAwake": false,
-            "topic": "",
-            "imessageTo": "",      // phone number or Apple ID email
+            "slackWebhook": "",    // Slack Incoming Webhook URL
+            "slackMention": "",    // member ID (U0123ABC) or "here"; mentioned on urgent alerts
             "cpuLimit": 105.0,      // °C, SoC die (Apple Silicon runs ~90-100 under heavy load)
             "batteryLimit": 45.0,   // °C, battery — the best "it's cooking in a bag" signal
             "sustainSeconds": 60.0, // must stay over the limit this long before acting
@@ -121,8 +121,8 @@ enum Prefs {
         ])
     }
     static var keepAwake: Bool { get { d.bool(forKey: "keepAwake") } set { d.set(newValue, forKey: "keepAwake") } }
-    static var topic: String { get { d.string(forKey: "topic") ?? "" } set { d.set(newValue, forKey: "topic") } }
-    static var imessageTo: String { get { d.string(forKey: "imessageTo") ?? "" } set { d.set(newValue, forKey: "imessageTo") } }
+    static var slackWebhook: String { get { d.string(forKey: "slackWebhook") ?? "" } set { d.set(newValue, forKey: "slackWebhook") } }
+    static var slackMention: String { get { d.string(forKey: "slackMention") ?? "" } set { d.set(newValue, forKey: "slackMention") } }
     static var cpuLimit: Double { get { d.double(forKey: "cpuLimit") } set { d.set(newValue, forKey: "cpuLimit") } }
     static var batteryLimit: Double { get { d.double(forKey: "batteryLimit") } set { d.set(newValue, forKey: "batteryLimit") } }
     static var sustain: Double { d.double(forKey: "sustainSeconds") }
@@ -130,71 +130,59 @@ enum Prefs {
     static var lowBattery: Int { get { d.integer(forKey: "lowBattery") } set { d.set(newValue, forKey: "lowBattery") } }
 }
 
-// MARK: - Phone notifications (ntfy.sh — free, no account; install the ntfy app and subscribe to your topic)
+// MARK: - Slack notifications (Incoming Webhook)
 
 enum Push {
-    /// Sends through every configured channel (ntfy and/or iMessage).
-    /// `done` runs once on the main thread: nil if everything sent, otherwise the problems.
+    /// Posts to the configured Slack webhook. `tags` are Slack emoji names; the first one prefixes the message.
+    /// Priority 4+ mentions `Prefs.slackMention`, so the Slack app sends a push notification.
+    /// `done` runs on the main thread: nil on success, otherwise the problem.
     static func send(_ title: String, _ message: String, priority: Int = 3, tags: String = "", done: ((String?) -> Void)? = nil) {
-        let group = DispatchGroup()
-        var problems: [String] = []
-        let lock = NSLock()
-        let collect: (String?) -> Void = { p in
-            if let p { lock.lock(); problems.append(p); lock.unlock() }
-            group.leave()
-        }
-        var any = false
-        if !Prefs.topic.trimmingCharacters(in: .whitespaces).isEmpty {
-            any = true; group.enter()
-            ntfy(title, message, priority: priority, tags: tags) { collect($0.map { "ntfy: \($0)" }) }
-        }
-        if !Prefs.imessageTo.trimmingCharacters(in: .whitespaces).isEmpty {
-            any = true; group.enter()
-            iMessage("\(title): \(message)") { collect($0.map { "iMessage: \($0)" }) }
-        }
-        guard any else { done?("No notification channel set up"); return }
-        group.notify(queue: .main) { done?(problems.isEmpty ? nil : problems.joined(separator: "\n\n")) }
-    }
+        let finish = { (p: String?) in DispatchQueue.main.async { done?(p) } }
+        let hook = Prefs.slackWebhook.trimmingCharacters(in: .whitespaces)
+        guard !hook.isEmpty else { finish("Slack isn't set up"); return }
+        guard let url = URL(string: hook), url.scheme == "https" else { finish("Invalid Slack webhook URL"); return }
 
-    /// Sends an iMessage through Messages.app. The first time, macOS asks to let LidLLM control Messages.
-    static func iMessage(_ text: String, done: @escaping (String?) -> Void) {
-        let to = Prefs.imessageTo.trimmingCharacters(in: .whitespaces)
-        let script = """
-        on run argv
-            tell application "Messages"
-                set svc to 1st account whose service type = iMessage
-                send (item 2 of argv) to participant (item 1 of argv) of svc
-            end tell
-        end run
-        """
-        DispatchQueue.global().async {
-            let r = Sys.run("/usr/bin/osascript", ["-e", script, to, text])
-            done(r.status == 0 ? nil : r.output.trimmingCharacters(in: .whitespacesAndNewlines))
+        var text = ""
+        if let emoji = tags.split(separator: ",").first { text += ":\(emoji): " }
+        text += "*\(title)*\n\(message)"
+        let mention = Prefs.slackMention.trimmingCharacters(in: .whitespaces)
+        if priority >= 4, !mention.isEmpty {
+            let tag = ["here", "channel", "@here", "@channel"].contains(mention.lowercased())
+                ? "<!\(mention.lowercased().replacingOccurrences(of: "@", with: ""))>" : "<@\(mention)>"
+            text = "\(tag) " + text
         }
-    }
 
-    static func ntfy(_ title: String, _ message: String, priority: Int, tags: String, done: @escaping (String?) -> Void) {
-        let topic = Prefs.topic.trimmingCharacters(in: .whitespaces)
-        let urlString = topic.contains("://") ? topic : "https://ntfy.sh/\(topic)"
-        guard let url = URL(string: urlString) else { done("Invalid topic"); return }
         var req = URLRequest(url: url, timeoutInterval: 8)
         req.httpMethod = "POST"
-        req.httpBody = message.data(using: .utf8)
-        req.setValue(title, forHTTPHeaderField: "Title")
-        req.setValue(String(priority), forHTTPHeaderField: "Priority")
-        if !tags.isEmpty { req.setValue(tags, forHTTPHeaderField: "Tags") }
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["text": text])
         URLSession.shared.dataTask(with: req) { data, response, error in
-            var problem: String?
-            if let error { problem = error.localizedDescription }
-            else if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                problem = "HTTP \(http.statusCode): " + (data.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+            if let error { finish(error.localizedDescription); return }
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                finish("HTTP \(http.statusCode): " + (data.flatMap { String(data: $0, encoding: .utf8) } ?? ""))
+                return
             }
-            done(problem)
+            finish(nil)
         }.resume()
     }
 }
 
 // MARK: - App
+
+/// NSButton that runs a closure; used for buttons inside alerts that shouldn't close them.
+final class ActionButton: NSButton {
+    private let handler: (NSButton) -> Void
+    init(title: String, handler: @escaping (NSButton) -> Void) {
+        self.handler = handler
+        super.init(frame: .zero)
+        self.title = title
+        bezelStyle = .rounded
+        target = self
+        action = #selector(fire)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    @objc private func fire() { handler(self) }
+}
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let sensors = Sensors()
@@ -406,9 +394,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         info("Warns at limit −10°C (CPU) / −5°C (battery); acts after \(Int(Prefs.sustain))s over limit")
         menu.addItem(.separator())
 
-        item(Prefs.topic.isEmpty ? "Set up ntfy notifications…" : "ntfy topic: \(Prefs.topic)", #selector(setTopic))
-        item(Prefs.imessageTo.isEmpty ? "Set up iMessage alerts…" : "iMessage to: \(Prefs.imessageTo)", #selector(setIMessage))
-        if !Prefs.topic.isEmpty || !Prefs.imessageTo.isEmpty { item("Send test notification", #selector(testPush)) }
+        item(Prefs.slackWebhook.isEmpty ? "Set up Slack alerts…" : "Slack alerts: on", #selector(setSlack))
+        if !Prefs.slackWebhook.isEmpty { item("Send test message", #selector(testPush)) }
         item("Launch at login", #selector(toggleLogin), checked: SMAppService.mainApp.status == .enabled)
         menu.addItem(.separator())
         let q = NSMenuItem(title: "Quit (restores normal sleep)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -422,37 +409,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func setLow(_ s: NSMenuItem) { Prefs.lowBattery = s.tag }
     @objc private func testPush() {
         let c = cpu.map { "\(Int($0))°C" } ?? "?"
-        Push.send("LidLLM test", "Notifications work. CPU is \(c).", priority: 3, tags: "white_check_mark") { [weak self] problem in
-            if let problem {
-                self?.alert("Test notification failed", problem)
-            } else {
-                var sent: [String] = []
-                if !Prefs.topic.isEmpty { sent.append("ntfy topic “\(Prefs.topic)”") }
-                if !Prefs.imessageTo.isEmpty { sent.append("iMessage to \(Prefs.imessageTo)") }
-                self?.alert("Test notification sent", "Sent via " + sent.joined(separator: " and ") + ".")
-            }
+        // Priority 4 so the mention (and therefore the phone push) is exercised too.
+        Push.send("LidLLM test", "Slack alerts work. CPU is \(c).", priority: 4, tags: "white_check_mark") { [weak self] problem in
+            if let problem { self?.alert("Test message failed", problem) }
+            else { self?.alert("Test message sent", "Check Slack on your phone.") }
         }
     }
 
-    @objc private func setIMessage() {
+    @objc private func setSlack() {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
-        a.messageText = "iMessage alerts"
+        a.messageText = "Slack alerts"
         a.informativeText = """
-        Alerts are sent from this Mac's Messages app to the phone number or Apple ID email below. Leave it empty to turn iMessage alerts off.
+        1. Click “Copy Manifest”, then “Open Slack Apps”.
+        2. Create New App → From a manifest → pick your workspace → paste.
+        3. Install to Workspace → pick the channel for alerts.
+        4. Features → Incoming Webhooks → copy the URL and paste it below.
+        5. Optional: your member ID (Slack → your profile → ⋮ → Copy member ID), or "here". Urgent alerts mention it, so your phone gets a push.
 
-        Note: if the recipient is the same Apple ID this Mac uses, your iPhone shows the message as one you sent, and usually without a notification. Use a different Apple ID to be sure it alerts.
+        Leave the URL empty to turn Slack alerts off.
         """
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
-        field.placeholderString = "+386 40 123 456 or name@icloud.com"
-        field.stringValue = Prefs.imessageTo
-        a.accessoryView = field
+        let width: CGFloat = 440
+
+        // Read-only, selectable manifest
+        let manifest = Self.slackManifest
+        let scroll = NSTextView.scrollableTextView()
+        let textView = scroll.documentView as! NSTextView
+        textView.string = manifest
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.textContainerInset = NSSize(width: 4, height: 4)
+        scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.heightAnchor.constraint(equalToConstant: 170).isActive = true
+        scroll.widthAnchor.constraint(equalToConstant: width).isActive = true
+
+        let copyButton = ActionButton(title: "Copy Manifest") { button in
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(manifest, forType: .string)
+            button.title = "Copied ✓"
+        }
+        let openButton = ActionButton(title: "Open Slack Apps") { _ in
+            NSWorkspace.shared.open(URL(string: "https://api.slack.com/apps?new_app=1")!)
+        }
+        let buttons = NSStackView(views: [copyButton, openButton])
+        buttons.orientation = .horizontal
+
+        func field(_ placeholder: String, _ value: String) -> NSTextField {
+            let f = NSTextField()
+            f.placeholderString = placeholder; f.stringValue = value
+            f.translatesAutoresizingMaskIntoConstraints = false
+            f.widthAnchor.constraint(equalToConstant: width).isActive = true
+            return f
+        }
+        let hook = field("Webhook URL: https://hooks.slack.com/services/…", Prefs.slackWebhook)
+        let mention = field("Member ID, e.g. U0123ABCD (optional)", Prefs.slackMention)
+
+        let stack = NSStackView(views: [scroll, buttons, hook, mention])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.setFrameSize(stack.fittingSize)
+        a.accessoryView = stack
         a.addButton(withTitle: "Save")
         a.addButton(withTitle: "Cancel")
-        a.window.initialFirstResponder = field
+        a.window.initialFirstResponder = hook
         if a.runModal() == .alertFirstButtonReturn {
-            Prefs.imessageTo = field.stringValue.trimmingCharacters(in: .whitespaces)
+            Prefs.slackWebhook = hook.stringValue.trimmingCharacters(in: .whitespaces)
+            Prefs.slackMention = mention.stringValue.trimmingCharacters(in: .whitespaces)
         }
+    }
+
+    /// The bundled Slack app manifest, without its comment header.
+    static var slackManifest: String {
+        guard let path = Bundle.main.path(forResource: "slack-app-manifest", ofType: "yml"),
+              let text = try? String(contentsOfFile: path, encoding: .utf8)
+        else { return "slack-app-manifest.yml is missing from the app bundle" }
+        return text.split(separator: "\n", omittingEmptySubsequences: false)
+            .drop { $0.hasPrefix("#") }
+            .joined(separator: "\n")
     }
 
     @objc private func toggleLogin() {
@@ -461,32 +497,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             else { try SMAppService.mainApp.register() }
         } catch {
             alert("Couldn't change login item", "\(error.localizedDescription)\n\nMove LidLLM.app to /Applications and try again, or add it in System Settings → General → Login Items.")
-        }
-    }
-
-    @objc private func setTopic() {
-        NSApp.activate(ignoringOtherApps: true)
-        let a = NSAlert()
-        a.messageText = "Phone notifications (ntfy)"
-        a.informativeText = """
-        1. Install the free “ntfy” app on your phone.
-        2. Subscribe to a topic name that's hard to guess (anyone who knows it can read it).
-        3. Enter the same topic here. A full URL works too, for a self-hosted server.
-        """
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
-        field.stringValue = Prefs.topic.isEmpty ? "lidllm-\(UUID().uuidString.prefix(8).lowercased())" : Prefs.topic
-        a.accessoryView = field
-        a.addButton(withTitle: "Save")
-        a.addButton(withTitle: "Cancel")
-        a.addButton(withTitle: "Copy Topic & Save")  // Universal Clipboard → paste straight into ntfy on the phone
-        a.window.initialFirstResponder = field
-        let response = a.runModal()
-        guard response != .alertSecondButtonReturn else { return }
-        let topic = field.stringValue.trimmingCharacters(in: .whitespaces)
-        Prefs.topic = topic
-        if response == .alertThirdButtonReturn {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(topic, forType: .string)
         }
     }
 

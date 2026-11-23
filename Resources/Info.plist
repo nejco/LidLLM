@@ -22,7 +22,5 @@
 	<true/>
 	<key>NSAppSleepDisabled</key>
 	<true/>
-	<key>NSAppleEventsUsageDescription</key>
-	<string>LidLLM uses Messages to send you an iMessage when your Mac overheats or is put to sleep.</string>
 </dict>
 </plist>

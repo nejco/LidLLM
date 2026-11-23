@@ -1,0 +1,49 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to publish releases on tags
+
+jobs:
+  build:
+    runs-on: macos-latest # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          swiftc --version
+
+      - name: Build LidLLM.app
+        run: ./build.sh
+
+      - name: Package DMG
+        run: |
+          # Disk image with the app and an Applications shortcut to drag it onto
+          mkdir dmg
+          cp -R LidLLM.app dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname LidLLM -srcfolder dmg -fs HFS+ -format UDZO -ov LidLLM.dmg
+          shasum -a 256 LidLLM.dmg
+
+      # archive: false uploads the DMG as-is, so the download is LidLLM.dmg, not a zip
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: LidLLM.dmg
+          archive: false
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" LidLLM.dmg \
+            --title "LidLLM $GITHUB_REF_NAME" --generate-notes
