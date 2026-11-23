@@ -170,6 +170,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Keep the app itself from being napped so the guard keeps ticking.
         activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated], reason: "LidLLM thermal monitor")
 
+        installEditMenu()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let menu = NSMenu()
         menu.delegate = self
@@ -395,10 +396,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
         field.stringValue = Prefs.topic.isEmpty ? "lidllm-\(UUID().uuidString.prefix(8).lowercased())" : Prefs.topic
         a.accessoryView = field
-        a.addButton(withTitle: "Save"); a.addButton(withTitle: "Cancel")
-        if a.runModal() == .alertFirstButtonReturn {
-            Prefs.topic = field.stringValue.trimmingCharacters(in: .whitespaces)
+        a.addButton(withTitle: "Save")
+        a.addButton(withTitle: "Cancel")
+        a.addButton(withTitle: "Copy Topic & Save")  // Universal Clipboard → paste straight into ntfy on the phone
+        a.window.initialFirstResponder = field
+        let response = a.runModal()
+        guard response != .alertSecondButtonReturn else { return }
+        let topic = field.stringValue.trimmingCharacters(in: .whitespaces)
+        Prefs.topic = topic
+        if response == .alertThirdButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(topic, forType: .string)
         }
+    }
+
+    /// Accessory (menu-bar-only) apps have no main menu, so ⌘C/⌘V/⌘X/⌘A do nothing in
+    /// text fields. A main menu with an Edit submenu wires up those shortcuts; it's never shown.
+    private func installEditMenu() {
+        let main = NSMenu()
+        let editItem = NSMenuItem()
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        main.addItem(editItem)
+        NSApp.mainMenu = main
     }
 
     private func askForSetup() {
