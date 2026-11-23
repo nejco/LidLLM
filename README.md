@@ -3,7 +3,8 @@
 A menu bar app that keeps your Mac awake with the lid closed (so Claude agents keep running), and protects it:
 
 - **Too hot?** If the lid is closed and the CPU (default 105°C) or the battery (default 45°C) stays over its limit for 60s, or macOS reports a *critical* thermal state, it posts an alert to Slack, turns keep-awake off, and puts the Mac to sleep right away. With the lid open it only notifies you.
-- **Getting warm?** You get a Slack warning at the limit minus 10°C (CPU) or minus 5°C (battery), at most once every 15 minutes.
+- **Getting warm?** You get a Slack warning if it stays within 10°C of the CPU limit, or 5°C of the battery limit, for 2 minutes. You get at most one every 15 minutes.
+- **No alerts while you're at the Mac:** with the lid open and the keyboard or trackpad used in the last 5 minutes, it doesn't post to Slack. For a hot Mac it plays a sound instead.
 - **Low battery:** on battery power it sleeps at 10% (you can change this).
 - **Offline:** if there's no internet for 15 minutes (you can change this), it sleeps. This only happens when the lid is closed or nobody has used the Mac for that long. Slack can't be reached while offline, so you get a "Mac woke up" message on Slack once it's back online.
 - Quitting the app restores normal sleep.

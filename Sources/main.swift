@@ -223,6 +223,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var canControl = false
 
     private var hotSince: Date?
+    private var warmSince: Date?
+
+    /// Lid open and keyboard/trackpad used in the last 5 minutes: you're at the Mac,
+    /// so Slack alerts would just be noise.
+    private var userPresent: Bool { !lidClosed && Sys.userIdleSeconds < 5 * 60 }
     private var lastWarning = Date.distantPast
     private var lastHotAlert = Date.distantPast
     private var sleepingForSafety = false
@@ -300,7 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if ok { self.offlineSince = nil } else if self.offlineSince == nil { self.offlineSince = Date() }
             }
         }
-        guard Prefs.keepAwake, !sleepingForSafety else { hotSince = nil; return }
+        guard Prefs.keepAwake, !sleepingForSafety else { hotSince = nil; warmSince = nil; return }
 
         // Offline: agents can't do anything without internet. Sleep once offline long enough,
         // if the lid is closed or nobody has touched the Mac for that long either.
@@ -330,7 +335,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hotSince = nil
 
         let warmReasons = reasons(cpuLimit: Prefs.cpuLimit - 10, battLimit: Prefs.batteryLimit - 5, critical: false)
-        if !warmReasons.isEmpty, Date().timeIntervalSince(lastWarning) > 15 * 60 {
+        guard !warmReasons.isEmpty else { warmSince = nil; return }
+        let since = warmSince ?? Date()
+        warmSince = since
+        // Short spikes are normal under load, so it must stay warm for 2 minutes.
+        if !userPresent, Date().timeIntervalSince(since) >= 120, Date().timeIntervalSince(lastWarning) > 15 * 60 {
             lastWarning = Date()
             Push.send("Mac is getting warm", warmReasons.joined(separator: ", ") + (lidClosed ? " (lid closed)" : ""),
                       priority: 4, tags: "warning")
@@ -352,6 +361,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !shouldSleep {
             guard Date().timeIntervalSince(lastHotAlert) > 10 * 60 else { return }
             lastHotAlert = Date()
+            if userPresent { NSSound(named: "Sosumi")?.play(); return }  // you're right here; no Slack
             Push.send("Mac is HOT", reason + (lidClosed ? "" : " (lid open, not sleeping)"),
                       priority: 5, tags: "rotating_light,fire")
             NSSound(named: "Sosumi")?.play()
@@ -380,6 +390,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if sleepingForSafety {
             sleepingForSafety = false
             hotSince = nil
+            warmSince = nil
             offlineSince = nil
             Push.send("Mac woke up", "It was put to sleep earlier (\(lastTrigger ?? "?")). Keep-awake is off.",
                       priority: 3, tags: "sunrise")
