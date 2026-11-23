@@ -11,6 +11,7 @@ A menu bar app that keeps your Mac awake with the lid closed (so Claude agents k
 1. `./build.sh --install` builds the app and copies it to /Applications. Then open it.
 2. Click the ☕/moon icon and choose **Keep awake with lid closed**. The first time, it asks for your password once. This adds `/etc/sudoers.d/lidllm`, which lets only your user run `pmset -a disablesleep 0|1` and `pmset sleepnow` without a password. To undo it: `sudo rm /etc/sudoers.d/lidllm`.
 3. Phone alerts: install the free **ntfy** app (iOS/Android) and subscribe to a topic name that's hard to guess. In LidLLM, open **Set up phone notifications…**, enter the same topic, then tap **Send test notification**.
+4. Or/also iMessage: **Set up iMessage alerts…** and enter a phone number or Apple ID email. macOS asks once to let LidLLM control Messages. A message to the same Apple ID as this Mac usually arrives on your iPhone without a notification, so use a different Apple ID.
 
 ## Caveat
 If LidLLM is force-killed while keep-awake is on, the Mac stays in no-sleep mode. Relaunch the app (it fixes this on start), or run `sudo pmset -a disablesleep 0`.

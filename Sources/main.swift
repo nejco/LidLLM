@@ -112,6 +112,7 @@ enum Prefs {
         d.register(defaults: [
             "keepAwake": false,
             "topic": "",
+            "imessageTo": "",      // phone number or Apple ID email
             "cpuLimit": 105.0,      // °C, SoC die (Apple Silicon runs ~90-100 under heavy load)
             "batteryLimit": 45.0,   // °C, battery — the best "it's cooking in a bag" signal
             "sustainSeconds": 60.0, // must stay over the limit this long before acting
@@ -121,6 +122,7 @@ enum Prefs {
     }
     static var keepAwake: Bool { get { d.bool(forKey: "keepAwake") } set { d.set(newValue, forKey: "keepAwake") } }
     static var topic: String { get { d.string(forKey: "topic") ?? "" } set { d.set(newValue, forKey: "topic") } }
+    static var imessageTo: String { get { d.string(forKey: "imessageTo") ?? "" } set { d.set(newValue, forKey: "imessageTo") } }
     static var cpuLimit: Double { get { d.double(forKey: "cpuLimit") } set { d.set(newValue, forKey: "cpuLimit") } }
     static var batteryLimit: Double { get { d.double(forKey: "batteryLimit") } set { d.set(newValue, forKey: "batteryLimit") } }
     static var sustain: Double { d.double(forKey: "sustainSeconds") }
@@ -131,17 +133,64 @@ enum Prefs {
 // MARK: - Phone notifications (ntfy.sh — free, no account; install the ntfy app and subscribe to your topic)
 
 enum Push {
-    static func send(_ title: String, _ message: String, priority: Int = 3, tags: String = "", done: (() -> Void)? = nil) {
+    /// Sends through every configured channel (ntfy and/or iMessage).
+    /// `done` runs once on the main thread: nil if everything sent, otherwise the problems.
+    static func send(_ title: String, _ message: String, priority: Int = 3, tags: String = "", done: ((String?) -> Void)? = nil) {
+        let group = DispatchGroup()
+        var problems: [String] = []
+        let lock = NSLock()
+        let collect: (String?) -> Void = { p in
+            if let p { lock.lock(); problems.append(p); lock.unlock() }
+            group.leave()
+        }
+        var any = false
+        if !Prefs.topic.trimmingCharacters(in: .whitespaces).isEmpty {
+            any = true; group.enter()
+            ntfy(title, message, priority: priority, tags: tags) { collect($0.map { "ntfy: \($0)" }) }
+        }
+        if !Prefs.imessageTo.trimmingCharacters(in: .whitespaces).isEmpty {
+            any = true; group.enter()
+            iMessage("\(title): \(message)") { collect($0.map { "iMessage: \($0)" }) }
+        }
+        guard any else { done?("No notification channel set up"); return }
+        group.notify(queue: .main) { done?(problems.isEmpty ? nil : problems.joined(separator: "\n\n")) }
+    }
+
+    /// Sends an iMessage through Messages.app. The first time, macOS asks to let LidLLM control Messages.
+    static func iMessage(_ text: String, done: @escaping (String?) -> Void) {
+        let to = Prefs.imessageTo.trimmingCharacters(in: .whitespaces)
+        let script = """
+        on run argv
+            tell application "Messages"
+                set svc to 1st account whose service type = iMessage
+                send (item 2 of argv) to participant (item 1 of argv) of svc
+            end tell
+        end run
+        """
+        DispatchQueue.global().async {
+            let r = Sys.run("/usr/bin/osascript", ["-e", script, to, text])
+            done(r.status == 0 ? nil : r.output.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+    }
+
+    static func ntfy(_ title: String, _ message: String, priority: Int, tags: String, done: @escaping (String?) -> Void) {
         let topic = Prefs.topic.trimmingCharacters(in: .whitespaces)
         let urlString = topic.contains("://") ? topic : "https://ntfy.sh/\(topic)"
-        guard !topic.isEmpty, let url = URL(string: urlString) else { done?(); return }
+        guard let url = URL(string: urlString) else { done("Invalid topic"); return }
         var req = URLRequest(url: url, timeoutInterval: 8)
         req.httpMethod = "POST"
         req.httpBody = message.data(using: .utf8)
         req.setValue(title, forHTTPHeaderField: "Title")
         req.setValue(String(priority), forHTTPHeaderField: "Priority")
         if !tags.isEmpty { req.setValue(tags, forHTTPHeaderField: "Tags") }
-        URLSession.shared.dataTask(with: req) { _, _, _ in DispatchQueue.main.async { done?() } }.resume()
+        URLSession.shared.dataTask(with: req) { data, response, error in
+            var problem: String?
+            if let error { problem = error.localizedDescription }
+            else if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                problem = "HTTP \(http.statusCode): " + (data.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+            }
+            done(problem)
+        }.resume()
     }
 }
 
@@ -285,7 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Sys.run("/usr/bin/pmset", ["sleepnow"])
         }
         Push.send("Mac put to sleep", "\(reason). Keep-awake turned off.", priority: 5,
-                  tags: "rotating_light,zzz", done: goToSleep)
+                  tags: "rotating_light,zzz", done: { _ in goToSleep() })
         DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: goToSleep)  // don't wait on a slow network
     }
 
@@ -357,8 +406,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         info("Warns at limit −10°C (CPU) / −5°C (battery); acts after \(Int(Prefs.sustain))s over limit")
         menu.addItem(.separator())
 
-        item(Prefs.topic.isEmpty ? "Set up phone notifications…" : "Phone notifications: \(Prefs.topic)", #selector(setTopic))
-        if !Prefs.topic.isEmpty { item("Send test notification", #selector(testPush)) }
+        item(Prefs.topic.isEmpty ? "Set up ntfy notifications…" : "ntfy topic: \(Prefs.topic)", #selector(setTopic))
+        item(Prefs.imessageTo.isEmpty ? "Set up iMessage alerts…" : "iMessage to: \(Prefs.imessageTo)", #selector(setIMessage))
+        if !Prefs.topic.isEmpty || !Prefs.imessageTo.isEmpty { item("Send test notification", #selector(testPush)) }
         item("Launch at login", #selector(toggleLogin), checked: SMAppService.mainApp.status == .enabled)
         menu.addItem(.separator())
         let q = NSMenuItem(title: "Quit (restores normal sleep)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -372,7 +422,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func setLow(_ s: NSMenuItem) { Prefs.lowBattery = s.tag }
     @objc private func testPush() {
         let c = cpu.map { "\(Int($0))°C" } ?? "?"
-        Push.send("LidLLM test", "Notifications work. CPU is \(c).", priority: 3, tags: "white_check_mark")
+        Push.send("LidLLM test", "Notifications work. CPU is \(c).", priority: 3, tags: "white_check_mark") { [weak self] problem in
+            if let problem {
+                self?.alert("Test notification failed", problem)
+            } else {
+                var sent: [String] = []
+                if !Prefs.topic.isEmpty { sent.append("ntfy topic “\(Prefs.topic)”") }
+                if !Prefs.imessageTo.isEmpty { sent.append("iMessage to \(Prefs.imessageTo)") }
+                self?.alert("Test notification sent", "Sent via " + sent.joined(separator: " and ") + ".")
+            }
+        }
+    }
+
+    @objc private func setIMessage() {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "iMessage alerts"
+        a.informativeText = """
+        Alerts are sent from this Mac's Messages app to the phone number or Apple ID email below. Leave it empty to turn iMessage alerts off.
+
+        Note: if the recipient is the same Apple ID this Mac uses, your iPhone shows the message as one you sent, and usually without a notification. Use a different Apple ID to be sure it alerts.
+        """
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        field.placeholderString = "+386 40 123 456 or name@icloud.com"
+        field.stringValue = Prefs.imessageTo
+        a.accessoryView = field
+        a.addButton(withTitle: "Save")
+        a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = field
+        if a.runModal() == .alertFirstButtonReturn {
+            Prefs.imessageTo = field.stringValue.trimmingCharacters(in: .whitespaces)
+        }
     }
 
     @objc private func toggleLogin() {
